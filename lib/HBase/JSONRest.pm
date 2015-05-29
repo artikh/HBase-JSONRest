@@ -458,6 +458,104 @@ sub delete {
     }
 }
 
+
+# =========================================================================
+# scan: scan the table calling
+#
+# Usage:
+# my $success = $hbase->delete({
+#   table      => 'table',
+#   batch_size => 1,
+#   callback   => sub {
+#     my @rows = @_;
+#     return 0; # return falsy defined value to stop
+#   }
+# })
+sub scan {
+    my ( $self, $attr ) = @_;
+    my $table       = delete $attr->{table} || die 'Table name required';
+    my $callback    = delete $attr->{callback} || die 'Callback is required';
+    my $batch_size  = delete $attr->{batch_size};
+    my $startRow    = delete $attr->{startRow};
+    my $endRow      = delete $attr->{endRow};
+    my $startTime   = delete $attr->{startTime};
+    my $endTime     = delete $attr->{endTime};
+    my $filter      = delete $attr->{filter};
+    my $column      = delete $attr->{column};
+
+    die "don't know what to do with argument(s) @{[ keys %$attr ]}"
+        if keys %$attr;
+
+    my @columns;
+    @columns = ref $column? @$column: [$column] if $column;
+
+    my $scanner_definition = "<Scanner";
+    $scanner_definition .= " batch=\"$batch_size\"" if defined $batch_size;
+    $scanner_definition .= ' startRow="' . encode_base64($startRow) . '"' if defined $startRow;
+    $scanner_definition .= ' endRow="' . encode_base64($endRow) . '"' if defined $endRow;
+    $scanner_definition .= " startTime=\"$startTime\"" if defined $startTime;
+    $scanner_definition .= " endTime=\"$endTime\"" if defined $endTime;
+    $scanner_definition .= '>';
+    $scanner_definition .= "<filter>$filter</filter>" if $filter;
+    $scanner_definition .= "<column>" . encode_base64($_) . "</column>" for @columns;
+    $scanner_definition .= "</Scanner>";
+
+    my $route = '/' . uri_escape($table) . '/scanner';
+    my $url = $self->{service} . $route;
+
+    my $http = HTTP::Tiny->new();
+
+    my $response = $http->request('PUT', $url, {
+        content => $scanner_definition,
+        headers => {
+            'content-type' => 'text/xml'
+        },
+    });
+
+    die 'Unable to create scanner: ' . ($response->{reason} // 'unknown reason')
+        unless ($response->{status} // '') eq '201';
+
+    my $scanner_url = $response->{headers}{location} or die "Scanner URL wasn't returned";
+
+    while (1) {
+        my $scanner_response = $http->get("$scanner_url?reversed=true", {
+            headers => {
+                'Accept' => 'application/json',
+            }
+        });
+
+        if ( !$scanner_response->{success} ) {
+           $self->{last_error} = HBase::JSONRest::_extract_error_tiny($url, $scanner_response);
+           return undef;
+        }
+
+        if ($scanner_response->{status} eq '204') {
+            last;
+        }
+
+        my $response = decode_json($scanner_response->{content});
+        my @rows = ();
+        foreach my $row (@{$response->{Row}}) {
+            my $key = decode_base64($row->{key});
+            my @cols = ();
+
+            foreach my $c (@{$row->{Cell}}) {
+                my $name = decode_base64($c->{column});
+                my $value = decode_base64($c->{'$'});
+                my $ts = $c->{timestamp};
+                push @cols, {name => $name, value => $value, timestamp => $ts};
+            }
+            push @rows, {row => $key, columns => \@cols};
+        }
+        my $should_continue = $callback->(@rows);
+        last if defined $should_continue and not $should_continue;
+    }
+
+    $http->delete($scanner_url); # just cleaning up - do not care for result
+
+    return 1;
+}
+
 # -------------------------------------------------------------------------
 # build get uri
 #
